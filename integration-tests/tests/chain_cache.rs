@@ -351,6 +351,187 @@ mod chain_query_interface {
         }
     }
 
+    #[ignore = "slow; mines ~220 regtest blocks to bury a finalised spend. Run manually / dedicated CI."]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_outpoint_spenders_zebrad() {
+        get_outpoint_spenders::<Zebrad, StateService>(&ValidatorKind::Zebrad).await
+    }
+
+    #[ignore = "slow; mines ~220 regtest blocks to bury a finalised spend. Run manually / dedicated CI."]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_outpoint_spenders_zcashd() {
+        get_outpoint_spenders::<Zcashd, FetchService>(&ValidatorKind::Zcashd).await
+    }
+
+    /// End-to-end check of `ChainIndex::get_outpoint_spenders` against a real regtest chain.
+    ///
+    /// Builds three transparent outpoints at the recipient address: one spent and buried past
+    /// the finalised floor, one spent but left in the non-finalised window, and one left
+    /// unspent. Then asserts the two `ChainScope`s resolve each correctly — `FullChain` sees
+    /// both spends, `Finalised` sees only the buried one. This is the only place the finalised
+    /// `TxLocation -> txid` resolution runs end-to-end (the in-tree mockchain vectors spend
+    /// nothing below the floor, and proptest blocks can't be finalised).
+    async fn get_outpoint_spenders<C, Service>(validator: &ValidatorKind)
+    where
+        C: ValidatorExt,
+        Service: zaino_testutils::TestService,
+        IndexerError: From<<<Service as ZcashService>::Subscriber as ZcashIndexer>::Error>,
+        <Service as ZcashService>::Subscriber: zaino_testutils::PollableTip,
+    {
+        use zaino_state::chain_index::types::{ChainScope, Outpoint, TransactionHash};
+        use zaino_testutils::from_inputs;
+        use zebra_rpc::client::GetAddressBalanceRequest;
+        use zip32::AccountId;
+
+        let (mut test_manager, _json_service, _state, _chain_index, indexer) =
+            create_test_manager_and_chain_index::<C, Service>(validator, None, true, true).await;
+
+        let mut clients = test_manager.clients.take().expect("clients are enabled");
+        let recipient_taddr = clients.get_recipient_address("transparent").await;
+
+        clients.faucet.sync_and_await().await.unwrap();
+
+        test_manager
+            .generate_blocks_and_wait_for_tip(100, &indexer)
+            .await;
+        clients.faucet.sync_and_await().await.unwrap();
+
+        if matches!(validator, ValidatorKind::Zebrad) {
+            clients.faucet.quick_shield(AccountId::ZERO).await.unwrap();
+        }
+        test_manager
+            .generate_blocks_and_wait_for_tip(10, &indexer)
+            .await;
+        clients.faucet.sync_and_await().await.unwrap();
+
+        // Outpoint that is SPENT and FINALISED ----
+        let fund_a = from_inputs::quick_send(
+            &mut clients.faucet,
+            vec![(recipient_taddr.as_str(), 250_000, None)],
+        )
+        .await
+        .unwrap();
+        test_manager
+            .generate_blocks_and_wait_for_tip(10, &indexer)
+            .await;
+        clients.recipient.sync_and_await().await.unwrap();
+        let want_a = TransactionHash::from(*fund_a.first());
+        let outpoint_finalised = {
+            let utxos = indexer
+                .get_address_utxos(GetAddressBalanceRequest::new(vec![recipient_taddr.clone()]))
+                .await
+                .unwrap();
+            let (_, txid, output_index, ..) = utxos
+                .iter()
+                .map(|u| u.into_parts())
+                .find(|(_, txid, ..)| TransactionHash::from(*txid) == want_a)
+                .expect("recipient must hold the UTXO created by funding tx A");
+            Outpoint::new(txid.0, output_index.index())
+        };
+        let spend_finalised = clients
+            .recipient
+            .quick_shield(AccountId::ZERO)
+            .await
+            .unwrap();
+        let spender_finalised = TransactionHash::from(*spend_finalised.first());
+
+        if matches!(validator, ValidatorKind::Zebrad) {
+            clients.faucet.quick_shield(AccountId::ZERO).await.unwrap();
+        }
+        test_manager
+            .generate_blocks_and_wait_for_tip(110, &indexer)
+            .await;
+
+        // ---- 2) Outpoint that is SPENT but stays NON-FINALISED ----
+        clients.faucet.sync_and_await().await.unwrap();
+        let fund_b = from_inputs::quick_send(
+            &mut clients.faucet,
+            vec![(recipient_taddr.as_str(), 250_000, None)],
+        )
+        .await
+        .unwrap();
+        test_manager
+            .generate_blocks_and_wait_for_tip(10, &indexer)
+            .await;
+        clients.recipient.sync_and_await().await.unwrap();
+        let want_b = TransactionHash::from(*fund_b.first());
+        let outpoint_nonfinalised = {
+            let utxos = indexer
+                .get_address_utxos(GetAddressBalanceRequest::new(vec![recipient_taddr.clone()]))
+                .await
+                .unwrap();
+            let (_, txid, output_index, ..) = utxos
+                .iter()
+                .map(|u| u.into_parts())
+                .find(|(_, txid, ..)| TransactionHash::from(*txid) == want_b)
+                .expect("recipient must hold the UTXO created by funding tx B");
+            Outpoint::new(txid.0, output_index.index())
+        };
+        let spend_nonfinalised = clients
+            .recipient
+            .quick_shield(AccountId::ZERO)
+            .await
+            .unwrap();
+        let spender_nonfinalised = TransactionHash::from(*spend_nonfinalised.first());
+
+        if matches!(validator, ValidatorKind::Zebrad) {
+            clients.faucet.quick_shield(AccountId::ZERO).await.unwrap();
+        }
+        test_manager
+            .generate_blocks_and_wait_for_tip(10, &indexer)
+            .await;
+
+        // ---- 3) Outpoint that is created but UNSPENT ----
+        clients.faucet.sync_and_await().await.unwrap();
+        let fund_c = from_inputs::quick_send(
+            &mut clients.faucet,
+            vec![(recipient_taddr.as_str(), 250_000, None)],
+        )
+        .await
+        .unwrap();
+        test_manager
+            .generate_blocks_and_wait_for_tip(10, &indexer)
+            .await;
+        clients.recipient.sync_and_await().await.unwrap();
+        let want_c = TransactionHash::from(*fund_c.first());
+        let outpoint_unspent = {
+            let utxos = indexer
+                .get_address_utxos(GetAddressBalanceRequest::new(vec![recipient_taddr.clone()]))
+                .await
+                .unwrap();
+            let (_, txid, output_index, ..) = utxos
+                .iter()
+                .map(|u| u.into_parts())
+                .find(|(_, txid, ..)| TransactionHash::from(*txid) == want_c)
+                .expect("recipient must hold the UTXO created by funding tx C");
+            Outpoint::new(txid.0, output_index.index())
+        };
+
+        // Let the chain index settle on the latest tip before snapshotting.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let snapshot = indexer.snapshot_nonfinalized_state().await.unwrap();
+        let outpoints = vec![outpoint_finalised, outpoint_nonfinalised, outpoint_unspent];
+
+        // FullChain resolves both the finalised and the non-finalised spend; unspent is None.
+        let full = indexer
+            .get_outpoint_spenders(&snapshot, outpoints.clone(), ChainScope::FullChain)
+            .await
+            .unwrap();
+        assert_eq!(
+            full,
+            vec![Some(spender_finalised), Some(spender_nonfinalised), None]
+        );
+
+        // Finalised resolves only the buried spend; the non-finalised spend and unspent are None.
+        let finalised = indexer
+            .get_outpoint_spenders(&snapshot, outpoints, ChainScope::Finalised)
+            .await
+            .unwrap();
+        assert_eq!(finalised, vec![Some(spender_finalised), None, None]);
+
+        test_manager.close().await;
+    }
+
     // #[ignore = "prone to timeouts and hangs, to be fixed in chain index integration"]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_subtree_roots_zebrad() {
