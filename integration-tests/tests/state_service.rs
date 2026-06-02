@@ -2463,6 +2463,8 @@ mod zebra {
         }
 
         mod address_deltas;
+
+        mod block_deltas;
     }
 
     pub(crate) mod lightwallet_indexer {
