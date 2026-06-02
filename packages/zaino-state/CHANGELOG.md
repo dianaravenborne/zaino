@@ -44,6 +44,11 @@ and this library adheres to Rust's notion of
   - `get_address_balance`
   - `get_address_txids`
   - `get_address_utxos`
+  - `get_outpoint_spenders` — for each transparent `Outpoint`, returns the
+    txid that spent it on the best chain (index-aligned with the input, `None`
+    if unspent or unknown)
+- `chain_index::types::ChainScope` — new enum (`Finalised`, `FullChain`)
+  selecting how far `get_outpoint_spenders` searches
 - `gettxoutsetinfo` is now served indexer-side via Zaino's own UTXO-set
   accumulator:
   - `chain_index::types::db::metadata::FinalisedTxOutSetInfoAccumulator` —

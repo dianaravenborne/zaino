@@ -20,6 +20,9 @@ and this library adheres to Rust's notion of
 - `ChainIndex::get_tx_out_set_info` — combines the finalised
   `FinalisedTxOutSetInfoAccumulator` with the non-finalised state to produce
   the full `GetTxOutSetInfoResponse`.
+- `ChainIndex::get_outpoint_spenders` — resolves, for each transparent
+  outpoint, the txid that spent it on the best chain (or `None` if unspent),
+  with a `ChainScope` selecting finalised-only or full-chain search.
 ### Changed
 - Integration tests now use `corez`, with Zcash, Zebra, and Zingo dependencies
   updated to releases and companion branches that no longer depend on the
